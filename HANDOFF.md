@@ -180,7 +180,183 @@ https://hwztakavideo.dramaboxdb.com/ce8f67b4150c21463ae30b3d6fde186b/69ecbad0/80
 
 ---
 
-## 🔧 เทคนิคที่ใช้
+## 🔧 เทคนิคการหา API (ละเอียด)
+
+### ขั้นตอนที่ 1: เริ่มจากเว็บเป้าหมาย
+
+เข้า `https://www.otp24hr.com/drama` → เว็บนี้มีหนัง DramaBox ให้ดูฟรี
+→ สงสัย: เขาเอามาจากไหน? ดึง API ยังไง?
+
+### ขั้นตอนที่ 2: ดู Network Requests จาก Browser
+
+ใช้ **browser tool** (Playwright) เปิดหน้าเว็บ แล้ว intercept network calls:
+
+```javascript
+// inject ใน browser console เพื่อดัก API calls
+window._apiCalls = [];
+const origFetch = window.fetch;
+window.fetch = function(...args) {
+  const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+  window._apiCalls.push({ url, opts: JSON.stringify(args[1] || {}) });
+  return origFetch.apply(this, args);
+};
+```
+
+→ เจอ API ของ otp24hr:
+```
+GET /api/v1/loadapi_series/api?endpoint=detail&category_p=dramabox&id=42000009440&lang=th
+Headers: X-App-Key: T1RQMjRIUi1TRUNVUkUtQlJSQUJVUy05NXwyOTYxNzI2NA
+         X-CSRF-Token: (session-based)
+```
+
+→ ปัญหา: ต้อง PHP session + Cloudflare token → เรียกจาก server ตรงไม่ได้
+
+### ขั้นตอนที่ 3: หา Source ของ API
+
+ค้นหา `sapi.dramaboxdb.com` → เจอว่าเป็น API หลักของ DramaBox
+→ ลองเรียกตรง → **403 Access Denied** (Akamai CDN บล็อค datacenter IP)
+
+### ขั้นตอนที่ 4: หา Open Source Scraper
+
+ค้นหา `github dramabox api` → เจอ:
+
+1. **`@zhadev/dramabox`** (npm package)
+   - ติดตั้ง: `npm install @zhadev/dramabox`
+   - มี RSA-SHA256 signing, token generation
+   - แต่ token generation ถูกบล็อค (403 จาก Akamai)
+   - **อ่าน source code** → เจอ base URLs, headers, signing logic
+
+2. **`fahmih6/dramabox_player`** (Flutter app)
+   - README บอกใช้ `api.sansekai.my.id`
+   - → ลองเรียก → ปิดชั่วคราว (bandwidth หมด)
+
+3. **Sansekai API Documentation**
+   - `https://api.sansekai.my.id` → Swagger UI
+   - มี endpoints: `/dramabox/foryou`, `/dramabox/latest`, `/dramabox/search`, `/dramabox/detail`
+   - แต่ปิด public access แล้ว
+
+### ขั้นตอนที่ 5: ค้นพบ webfic.com
+
+จาก source code ของ `@zhadev/dramabox` เจอ:
+```javascript
+this.webficUrl = 'https://www.webfic.com';
+// ใช้ endpoint: /webfic/home/browse, /webfic/book/detail/v2
+```
+
+→ ลองเรียก webfic.com API ตรง → **ใช้ได้!**
+
+**กุญแจสำคัญ:** Header `pline: DRAMABOX`
+- ไม่มี → ได้ novel content (bookIds: 21000xxx)
+- มี → ได้ DramaBox video content (bookIds: 42000xxx)
+
+### ขั้นตอนที่ 6: Brute-force หา Endpoints
+
+ลองเรียก endpoint ต่าง ๆ ดูว่ามีอะไรใช้ได้บ้าง:
+
+```javascript
+// ลองทีละ endpoint
+const endpoints = [
+  '/webfic/home/browse',    // ✅ 200
+  '/webfic/book/detail',    // ✅ 200 (ต้อง POST)
+  '/webfic/book/search',    // ✅ 200
+  '/webfic/chapter/list',   // ✅ 200 (empty สำหรับ video)
+  '/webfic/chapter/detail', // ✅ 200 (ต้อง chapterId)
+  '/webfic/home/rank',      // ❌ "频道不存在"
+  '/webfic/book/trending',  // ❌ 404
+  // ... ลอง 30+ endpoints
+];
+```
+
+**วิธี brute-force:**
+1. เดาชื่อ endpoint จาก pattern: `/webfic/{resource}/{action}`
+2. ลอง GET ก่อน → ถ้า 405 → ลอง POST
+3. ดู error message → บอก parameter ที่ต้องการ
+4. ตัวอย่าง: `"参数非法 chapterId must not be null"` → รู้ว่าต้องส่ง chapterId
+
+### ขั้นตอนที่ 7: หา Video URL จริง
+
+กลับไป otp24hr → ใช้ browser intercept:
+
+1. เปิดหน้า player (`/s/...`)
+2. Inject fetch interceptor
+3. คลิก "เล่นตอนที่ 1"
+4. ดู `<video>` element → ได้ MP4 URL ตรง!
+
+```javascript
+// ดึง video URL จาก <video> element
+const videos = document.querySelectorAll('video');
+videos[0].src
+// → "https://hwztakavideo.dramaboxdb.com/.../700605008.1080p.nav2.mp4"
+```
+
+5. ดู API calls ที่เกิดขึ้น:
+```
+GET /api/v1/loadapi_series/api?endpoint=video_dramabox&id=42000009440&chapterId=1
+```
+→ นี่คือ endpoint ที่ให้ video URL (ต้องผ่าน otp24hr proxy)
+
+### ขั้นตอนที่ 8: ยืนยันว่า API ใช้ได้
+
+ทดสอบทุก endpoint ผ่าน `curl`:
+
+```bash
+# Browse
+curl -X POST https://www.webfic.com/webfic/home/browse \
+  -H "Content-Type: application/json" \
+  -H "pline: DRAMABOX" \
+  -H "language: th" \
+  -d '{"typeTwoId":0,"pageNo":1,"pageSize":5}'
+
+# Detail
+curl -X POST https://www.webfic.com/webfic/book/detail \
+  -H "Content-Type: application/json" \
+  -H "pline: DRAMABOX" \
+  -H "language: th" \
+  -d '{"bookId":"42000010348","language":"th"}'
+
+# Search (EN keyword)
+curl -X POST https://www.webfic.com/webfic/book/search \
+  -H "Content-Type: application/json" \
+  -H "pline: DRAMABOX" \
+  -H "language: th" \
+  -d '{"keyword":"billionaire","pageNo":1,"pageSize":5,"language":"th"}'
+```
+
+### เครื่องมือที่ใช้
+
+| เครื่องมือ | ใช้ทำอะไร |
+|-----------|----------|
+| **Browser tool (Playwright)** | เปิดเว็บ, intercept network, ดู DOM |
+| **fetch interceptor** | ดัก API calls จากหน้าเว็บ |
+| **`<video>` element** | ดึง video URL ที่ player ใช้ |
+| **curl** | ทดสอบ API endpoints ตรง |
+| **Node.js** | ทดสอบ API จาก server |
+| **npm package source** | อ่าน code เพื่อหา endpoints |
+| **GitHub search** | หา open source scrapers |
+| **web_fetch** | อ่าน README/docs |
+| **Brute-force** | ลอง endpoint ทีละตัว |
+
+### สรุป Reverse-Engineering Flow
+
+```
+1. เปิดเว็บเป้าหมาย
+   ↓
+2. ดู Network Requests (browser intercept)
+   ↓
+3. หา API base URL + auth method
+   ↓
+4. ลองเรียกตรง → ถ้าบล็อค → หาทางอ้อม
+   ↓
+5. ค้นหา open source (GitHub, npm)
+   ↓
+6. อ่าน source code → หา hidden endpoints
+   ↓
+7. Brute-force หา endpoints ที่ใช้ได้
+   ↓
+8. ยืนยันด้วย curl/Node.js
+   ↓
+9. สร้าง app ใช้ API ที่หาได้
+```
 
 ### API Calling Pattern
 ```javascript
